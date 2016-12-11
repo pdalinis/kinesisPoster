@@ -1,0 +1,12 @@
+[
+    {
+        "key": "myKey",
+        "url": "http://localhost:8000/event1",
+        "value": "myValue"
+    },
+    {
+        "key": "myKey",
+        "url": "http://localhost:8000/event2",
+        "value": "otherValue"
+    }
+]
