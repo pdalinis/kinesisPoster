@@ -1,5 +1,4 @@
-// TODO: Handle throughput exceeded error from kinesis
-// TODO: Persist shard iterator
+// TODO: Persist shard iterator off filesystem
 // TODO: support any number of shards
 // TODO: Post async
 
@@ -10,6 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -43,9 +43,19 @@ func main() {
 
 	client := kinesis.New(session.New(), &aws.Config{Region: aws.String(*region)})
 
-	shardIterator, err := getIterator(client)
-	if err != nil {
-		panic(fmt.Errorf("Could not get iterator from Kinesis %v", err))
+	var shardIterator *string
+	sequenceNumber := getSequenceNumberFromDisk()
+
+	if sequenceNumber == "" {
+		shardIterator, err = getIteratorFromNow(client)
+		if err != nil {
+			panic(fmt.Errorf("Could not get starting iterator from Kinesis %v", err))
+		}
+	} else {
+		shardIterator, err = getIteratorFromSequenceNumber(sequenceNumber, client)
+		if err != nil {
+			panic(fmt.Errorf("Could not get iterator from Kinesis for sequence number %s - %v", sequenceNumber, err))
+		}
 	}
 
 	log.Printf("Starting with shard iterator %s\n", *shardIterator)
@@ -63,26 +73,39 @@ func main() {
 
 			if err != nil {
 				log.Printf("Error calling GetRecords: %v", err)
-				time.Sleep(500 * time.Millisecond)
+				time.Sleep(1100 * time.Millisecond)
 				continue
 			}
 
-			shardIterator = resp.NextShardIterator
+			if resp.NextShardIterator == nil {
+				log.Print("NextShardIterator is null, stream has been closed, shutting down")
+				signals <- syscall.SIGTERM
+			} else {
+				shardIterator = resp.NextShardIterator
+				if *resp.MillisBehindLatest > 5000 {
+					log.Printf("More than 5 seconds behind")
+				}
+			}
 
 			var msg map[string]interface{}
 
 			for _, r := range resp.Records {
+				msg = nil
 				if err := json.Unmarshal(r.Data, &msg); err != nil {
-					log.Printf("Could not unmarshal kinesis data %v", err)
+					log.Printf("Could not unmarshal kinesis data for sequence %s, %v", *r.SequenceNumber, err)
 					continue
 				}
 
 				url := filters.findUrl(msg)
 				if url != "" {
-					post(url, *r.SequenceNumber, r.Data)
+					err = post(url, *r.SequenceNumber, r.Data)
+					if err != nil {
+						log.Print(err)
+					}
+				} else {
+					persistSequenceNumberToDisk(*r.SequenceNumber)
 				}
 
-				msg = nil
 			}
 
 			select {
@@ -100,20 +123,49 @@ func main() {
 	<-shutdown
 }
 
-func post(url, sequence string, data []byte) {
+func post(url, sequence string, data []byte) error {
 	resp, err := http.Post(url, "application/json", bytes.NewReader(data))
 
 	if err != nil {
-		log.Printf("Error posting to %v for sequence number %v- %v", url, sequence, err)
-		return
+		return fmt.Errorf("Error posting to %v for sequence number %s- %v", url, sequence, err)
 	}
 	if resp.StatusCode > 200 || resp.StatusCode >= 300 {
-		log.Printf("Received status code %d when posting to %v for sequence number %v- %v", resp.StatusCode, url, sequence, err)
+		return fmt.Errorf("Received status code %d when posting to %s for sequence number %s- %v", resp.StatusCode, url, sequence, err)
 	}
 	defer resp.Body.Close()
+	return nil
 }
 
-func getIterator(client *kinesis.Kinesis) (*string, error) {
+func persistSequenceNumberToDisk(number string) {
+	ioutil.WriteFile("current_sequence_number", []byte(number), 0644)
+}
+
+func getSequenceNumberFromDisk() string {
+	number, _ := ioutil.ReadFile("current_sequence_number")
+	return string(number)
+}
+
+func getIterator(client *kinesis.Kinesis, input *kinesis.GetShardIteratorInput) (*string, error) {
+	sout, err := client.GetShardIterator(input)
+	if err != nil {
+		return nil, err
+	}
+
+	return sout.ShardIterator, nil
+}
+
+func getIteratorFromSequenceNumber(sequenceNumber string, client *kinesis.Kinesis) (*string, error) {
+	sinput := &kinesis.GetShardIteratorInput{
+		ShardId:                shardID,
+		ShardIteratorType:      aws.String("AFTER_SEQUENCE_NUMBER"),
+		StartingSequenceNumber: aws.String(sequenceNumber),
+		StreamName:             stream,
+	}
+
+	return getIterator(client, sinput)
+}
+
+func getIteratorFromNow(client *kinesis.Kinesis) (*string, error) {
 	sinput := &kinesis.GetShardIteratorInput{
 		ShardId:           shardID,
 		ShardIteratorType: aws.String("AT_TIMESTAMP"),
@@ -121,10 +173,5 @@ func getIterator(client *kinesis.Kinesis) (*string, error) {
 		StreamName:        stream,
 	}
 
-	sout, err := client.GetShardIterator(sinput)
-	if err != nil {
-		return nil, err
-	}
-
-	return sout.ShardIterator, nil
+	return getIterator(client, sinput)
 }

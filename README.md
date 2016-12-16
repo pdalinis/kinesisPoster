@@ -18,3 +18,6 @@ Read from a Kinesis stream and perform http posts conditionally based on the dat
  1. The json value to match on
  1. The URL to post the data to
 
+## Logging
+
+The logger writes all output to stderr.

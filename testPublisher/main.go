@@ -14,7 +14,7 @@ var region = flag.String("region", "us-west-2", "The aws region")
 
 func main() {
 	flag.Parse()
-	if stream == nil {
+	if *stream == "" {
 		panic("stream is required")
 	}
 
